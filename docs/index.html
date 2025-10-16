@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YQ Notify · WebApp</title>
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* toggle switch 外觀 */
+  .switch{position:relative;display:inline-block;width:52px;height:28px}
+  .switch input{display:none}
+  .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;border-radius:28px;background:#d6d9de;transition:.2s}
+  .slider:before{content:"";position:absolute;height:22px;width:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+  input:checked + .slider{background:#1e7f53}
+  input:checked + .slider:before{transform:translateX(24px)}
+
+  .rowline{display:flex;align-items:center;justify-content:space-between;
+    border:1px solid #cfe3d3;border-radius:12px;padding:12px 14px}
+  .rowline b{font-weight:600}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+</style>
+
+<!-- 六路測試（名稱 + 滑動開關） -->
+<div class="card">
+  <h3>控制輸出</h3>
+  <div class="grid">
+    <div class="rowline"><b id="n0">CH1</b><label class="switch"><input id="ch0" type="checkbox"><span class="slider"></span></label></div>
+    <div class="rowline"><b id="n1">CH2</b><label class="switch"><input id="ch1" type="checkbox"><span class="slider"></span></label></div>
+    <div class="rowline"><b id="n2">CH3</b><label class="switch"><input id="ch2" type="checkbox"><span class="slider"></span></label></div>
+    <div class="rowline"><b id="n3">CH4</b><label class="switch"><input id="ch3" type="checkbox"><span class="slider"></span></label></div>
+    <div class="rowline"><b id="n4">CH5</b><label class="switch"><input id="ch4" type="checkbox"><span class="slider"></span></label></div>
+    <div class="rowline"><b id="n5">CH6</b><label class="switch"><input id="ch5" type="checkbox"><span class="slider"></span></label></div>
+  </div>
+</div>
+
+
+<!-- 計數器 -->
+<div class="card">
+  <h3>工件計數設定</h3>
+  <div style="margin-top:14px">
+  </div>
+</div>
+    <div class="row">
+      <div>
+        <label>#1 達標門檻（cn0，0=停用）</label>
+        <input id="cn0" type="number" min="0" step="1" value="0" inputmode="numeric">
+      </div>
+      <div>
+        <label>#2 每日推播時間（ct1，HH:MM）</label>
+        <input id="ct1" placeholder="17:30" inputmode="numeric">
+      </div>
+    </div>
+    <small class="hint">本頁只負責送出設定；實際動作（部分保持秒數等設定）回首頁詳細設定。</small>
+  </div>
+
+  <div id="tg_state" style="position:fixed;right:10px;bottom:10px;padding:6px 10px;border-radius:12px;background:#eee;font:12px/1.2 system-ui">檢查中…</div>
+
+<script>
+(function(){
+  const qs = new URLSearchParams(location.search);
+  const dev = qs.get('dev');        // 由 webappUrlWithState() 注入的 http://<裝置IP>
+  const $ = (sel)=>document.querySelector(sel);
+
+  // 這兩個是你的欄位 id/name（依你頁面實際 id 調整）
+  const elCn0 = document.getElementById('cn0');
+  const elCt1 = document.getElementById('ct1');  // HH:MM 的輸入框
+  const badge  = document.getElementById('syncBadge'); // 顯示「已同步/同步失敗」的小標籤
+
+  async function syncFromDevice(){
+    if(!dev) { badge && (badge.textContent='同步失敗（缺 dev 參數）'); return; }
+    try{
+      // 先打本機裝置 API 取最新值
+      const resp = await fetch(dev + '/webapp-export', { method:'GET' });
+      if(!resp.ok) throw new Error('HTTP '+resp.status);
+      const j = await resp.json();   // 例如：{cn0: 88, ct1:"21:18", chs:"010101"}
+
+      // 寫回表單（依你的實際欄位改這裡）
+      if (elCn0) elCn0.value = j.cn0 ?? elCn0.value;
+      if (elCt1) elCt1.value = j.ct1 ?? elCt1.value;
+
+      // 顯示同步成功
+      badge && (badge.textContent = '已同步（即時）');
+    }catch(e){
+      // 失敗就維持原本 URL 參數填入的舊值，並提示
+      badge && (badge.textContent = '同步失敗（使用 URL 參數）');
+      console.warn('syncFromDevice fail:', e);
+    }
+  }
+
+  // 頁面載入就先同步一次，再讓使用者操作
+  window.addEventListener('DOMContentLoaded', syncFromDevice);
+})();
+(function(){
+  const tg = window.Telegram && window.Telegram.WebApp;
+
+  // ===== 驗證 HH:MM =====
+  function validHHMM(v){
+    if(!v) return true;
+    const m = /^(\d{1,2}):(\d{2})$/.exec(v.trim()); if(!m) return false;
+    const hh=+m[1], mm=+m[2]; return hh>=0&&hh<=23&&mm>=0&&mm<=59;
+  }
+
+  // ===== 收集目前畫面設定 =====
+  function collect(){
+    const chs=[]; 
+    for(let i=0;i<6;i++) chs.push(document.getElementById('ch'+i).checked?1:0);
+    let cn0 = parseInt(document.getElementById('cn0').value||'0',10); 
+    if(isNaN(cn0)||cn0<0) cn0=0;
+    const ct1=(document.getElementById('ct1').value||'').trim();
+    if(!validHHMM(ct1)){ alert('請輸入 HH:MM 或留白'); throw new Error('bad time'); }
+    return { chs, cn0, ct1 };
+  }
+
+  // ===== 傳送設定到裝置 =====
+  function doSend(){
+    if(!(tg && tg.sendData)){ alert('請從 Telegram 內開啟此頁'); return; }
+    let payload; try{ payload = collect(); }catch(e){ return; }
+    const packet = { type:"save_config", payload, version:2 };
+    tg.showAlert && tg.showAlert('設定已送出，裝置將套用。');
+    tg.sendData(JSON.stringify(packet));
+    tg.close && tg.close();
+  }
+
+  // ===== 設定 Telegram 主按鈕或本地備援按鈕 =====
+  if(tg && tg.MainButton){
+    tg.ready && tg.ready(); 
+    tg.expand && tg.expand();
+    tg.MainButton.setText('送出到裝置');
+    tg.MainButton.onClick(doSend);
+    tg.MainButton.show();
+  } else {
+    const btn = document.createElement('button');
+    btn.textContent = '送出設定';
+    btn.className = 'btn';
+    btn.style = 'width:100%;margin-top:14px';
+    btn.onclick = doSend;
+    document.querySelector('.card:last-of-type').appendChild(btn);
+  }
+
+  // ===== 從 URL 預填狀態 =====
+  const qp = new URLSearchParams(location.search);
+  if (qp.has('cn0')) document.getElementById('cn0').value = Math.max(0, parseInt(qp.get('cn0')||'0',10));
+  if (qp.has('ct1')) document.getElementById('ct1').value = (qp.get('ct1')||'').trim();
+  if (qp.has('chs')) {
+    const s = (qp.get('chs')||'').trim();
+    for(let i=0;i<6;i++){
+      const el=document.getElementById('ch'+i);
+      if(el && i<s.length) el.checked = (s[i]==='1');
+    }
+  }
+  for(let i=0;i<6;i++){
+    const key='n'+i;
+    if(qp.has(key)){
+      const t=(qp.get(key)||'').trim();
+      if(t) document.getElementById(key).textContent=t;
+    }
+  }
+
+  // ===== 新增：從裝置即時同步最新設定 =====
+  async function fetchLiveIfAny(){
+    const dev = qp.get('dev'); // e.g. http://192.168.1.120
+    if(!dev) return;
+    try{
+      const res = await fetch(dev.replace(/\/$/,'') + '/webapp-export', { mode:'cors' });
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const j = await res.json();
+
+      // 覆蓋欄位
+      if (j.cn0 != null)
+        document.getElementById('cn0').value = Math.max(0, parseInt(j.cn0,10)||0);
+      if (j.ct1)
+        document.getElementById('ct1').value = (j.ct1||'').trim();
+      if (typeof j.chs === 'string'){
+        for(let i=0;i<6;i++){
+          const el = document.getElementById('ch'+i);
+          if (el && i<j.chs.length)
+            el.checked = (j.chs[i]==='1');
+        }
+      }
+      const s = document.getElementById('tg_state');
+      if (s) s.textContent = '✅ 已從裝置同步最新設定';
+      console.log('live config:', j);
+    }catch(e){
+      const s = document.getElementById('tg_state');
+      if (s) s.textContent = '⚠️ 同步失敗（使用 URL 參數）';
+      console.warn('export fetch fail:', e);
+    }
+  }
+
+  // 呼叫同步
+  fetchLiveIfAny();
+})();
+</script>
+
+
+
+</body>
+
